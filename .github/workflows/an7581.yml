@@ -4,25 +4,80 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag
-        required: true
+        description: Release tag (e.g. 20261001). Leave empty to auto-generate from date.
+        required: false
         type: string
       prerelease:
         description: Mark as prerelease
         required: true
         default: true
         type: boolean
+  schedule:
+    # 每天北京时间 01:00 触发。GitHub Actions 的 cron 用 UTC，01:00 CST(UTC+8) = 前一天 17:00 UTC
+    - cron: '0 17 * * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ inputs.tag || 'scheduled' }}
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Resolve release tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      skip: ${{ steps.resolve.outputs.skip }}
+
+    steps:
+      - name: Resolve release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # 定时触发（或手动未填 tag）时，用当天日期当版本号，例：20261001
+          if [ "$EVENT_NAME" = "schedule" ] || [ -z "$INPUT_TAG" ]; then
+            TAG="$(TZ=Asia/Shanghai date +'%Y%m%d')"
+          else
+            TAG="$INPUT_TAG"
+          fi
+
+          # 定时构建固定发 prerelease，手动构建沿用输入值
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="${INPUT_PRERELEASE:-true}"
+          fi
+
+          # 同一天的版本已存在时，定时构建直接跳过，避免重复编译
+          SKIP="false"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::warning::Release $TAG already exists"
+            if [ "$EVENT_NAME" = "schedule" ]; then
+              echo "Scheduled run: $TAG already released, skipping build"
+              SKIP="true"
+            fi
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG prerelease=$PRERELEASE skip=$SKIP"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
@@ -107,7 +162,8 @@ jobs:
 
   release:
     name: Create release
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -127,8 +183,8 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           args=(
             "$RELEASE_TAG"
