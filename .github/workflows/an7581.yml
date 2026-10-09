@@ -74,9 +74,111 @@ jobs:
           echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
           echo "Resolved: tag=$TAG prerelease=$PRERELEASE skip=$SKIP"
 
+  # ---------------------------------------------------------------------------
+  # 编译前先把上游 pbs05/ponwrt:master 的最新提交合并进来，并把结果推回本仓库，
+  # 保证「编译的代码」「release tag 指向的 commit」「fork 的 master」三者一致。
+  # ---------------------------------------------------------------------------
+  sync:
+    name: Sync upstream
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # 同步动作串行化，避免两次运行同时推 fork 造成 non-fast-forward
+    concurrency:
+      group: ponwrt-upstream-sync
+      cancel-in-progress: false
+    outputs:
+      sha: ${{ steps.push.outputs.sha || steps.sync.outputs.sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      upstream_short: ${{ steps.sync.outputs.upstream_short }}
+      upstream_date: ${{ steps.sync.outputs.upstream_date }}
+      updated: ${{ steps.sync.outputs.updated }}
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          ref: master
+          # merge 需要共同祖先，必须拉完整历史（默认 fetch-depth: 1 会失败）
+          fetch-depth: 0
+
+      - name: Merge upstream pbs05/ponwrt:master
+        id: sync
+        env:
+          UPSTREAM_REPO: pbs05/ponwrt
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B master
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --no-tags upstream master
+
+          UPSTREAM_SHA="$(git rev-parse upstream/master)"
+          UPSTREAM_SHORT="$(git rev-parse --short=7 upstream/master)"
+          UPSTREAM_DATE="$(git log -1 --format=%cI upstream/master)"
+
+          # 已经是上游的祖先 => 无需合并，直接编译当前 master
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "✅ 本地 master 已包含上游最新提交 ${UPSTREAM_SHORT}"
+            UPDATED="false"
+          else
+            echo "⬆️  上游有新提交 ${UPSTREAM_SHORT}，开始合并"
+            git --no-pager log --oneline --max-count=15 "HEAD..${UPSTREAM_SHA}" || true
+            if ! git merge --no-edit "$UPSTREAM_SHA"; then
+              echo "::error::与上游合并发生冲突，需要人工介入。冲突文件如下："
+              git diff --name-only --diff-filter=U || true
+              git merge --abort || true
+              exit 1
+            fi
+            UPDATED="true"
+          fi
+
+          echo "updated=$UPDATED" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$UPSTREAM_SHORT" >> "$GITHUB_OUTPUT"
+          echo "upstream_date=$UPSTREAM_DATE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 上游同步（\`${UPSTREAM_REPO}\`）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游最新提交 | \`${UPSTREAM_SHORT}\` |"
+            echo "| 上游提交时间 | ${UPSTREAM_DATE} |"
+            echo "| 本次是否合并 | ${UPDATED} |"
+            echo "| 编译基点 | \`$(git rev-parse --short HEAD)\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push merged state back to fork
+        id: push
+        if: steps.sync.outputs.updated == 'true'
+        run: |
+          set -euo pipefail
+
+          for attempt in 1 2 3; do
+            if git push origin HEAD:master; then
+              echo "✅ 已推回 fork，master = $(git rev-parse --short HEAD)"
+              echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::第 ${attempt} 次推送失败，拉取远端 master 后重试"
+            git fetch origin master
+            git merge --no-edit origin/master
+          done
+
+          echo "::error::连续 3 次推送 fork 失败，请检查仓库 Settings → Actions → General → Workflow permissions 是否为 Read and write"
+          exit 1
+
   build:
     name: Build ${{ matrix.target }}
-    needs: prepare
+    needs: [prepare, sync]
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -87,7 +189,12 @@ jobs:
           - an7581
 
     steps:
-      - uses: actions/checkout@v6
+      # 关键：编译 sync 产出的合并后提交，而不是触发时的工作流版本
+      - name: Checkout merged source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 1
 
       - name: Free build space
         run: |
@@ -162,7 +269,7 @@ jobs:
 
   release:
     name: Create release
-    needs: [prepare, build]
+    needs: [prepare, sync, build]
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -185,13 +292,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          # tag 指向合并后的提交（已推回 fork，一定真实存在）
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
         run: |
           args=(
             "$RELEASE_TAG"
             release/*.tar.zst
             release/sha256sums
             --repo "$GITHUB_REPOSITORY"
-            --target "$GITHUB_SHA"
+            --target "$BUILD_SHA"
             --title "PonWrt $RELEASE_TAG"
             --generate-notes
           )
@@ -199,3 +308,33 @@ jobs:
             args+=(--prerelease)
           fi
           gh release create "${args[@]}"
+
+      # 溯源信息只能追加（gh 不允许 --generate-notes 与 --notes 同时用）
+      - name: Append build provenance to release notes
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_SHORT: ${{ needs.sync.outputs.upstream_short }}
+          UPSTREAM_DATE: ${{ needs.sync.outputs.upstream_date }}
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json body -q .body > /tmp/body.md || true
+          {
+            cat /tmp/body.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "**构建溯源**"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 | \`pbs05/ponwrt@${UPSTREAM_SHORT}\` |"
+            echo "| 上游提交时间 | ${UPSTREAM_DATE} |"
+            echo "| 本仓库编译提交 | \`${BUILD_SHA}\` |"
+            echo "| 工作流 | \`an7581.yml\` |"
+          } > /tmp/newbody.md
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file /tmp/newbody.md
