@@ -241,17 +241,66 @@ jobs:
           fi
 
       - name: Configure ${{ matrix.target }}
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_SHORT: ${{ needs.sync.outputs.upstream_short }}
         run: |
-          ./scripts/kconfig.pl + \
-            "configs/${{ matrix.target }}.config" \
-            configs/release.config > .config
+          set -euo pipefail
+
+          # scripts/getver.sh 的 try_version 优先于 try_git：在仓库根写一个 version 文件，
+          # 就能把浅克隆下算错的 REVISION（形如 r0-863a3b9）换成本次构建的版本号
+          printf '%s\n' "$BUILD_VERSION" > version
+
+          # 合并基础配置 + release 开关，再追加版本信息覆盖。
+          # VERSION_DIST 与 VERSION_FILENAMES 必须显式给出，否则会继承 Kconfig 默认值：
+          #   VERSION_DIST      默认 ImmortalWrt（会把发行版名改掉）
+          #   VERSION_FILENAMES 默认 y（会把版本号加进固件文件名）
+          {
+            ./scripts/kconfig.pl + \
+              "configs/${{ matrix.target }}.config" \
+              configs/release.config
+            printf '%s\n' \
+              'CONFIG_VERSIONOPT=y' \
+              'CONFIG_VERSION_DIST="PonWrt"' \
+              "CONFIG_VERSION_NUMBER=\"$BUILD_VERSION\"" \
+              "CONFIG_VERSION_CODE=\"$UPSTREAM_SHORT\"" \
+              'CONFIG_VERSION_FILENAMES=n' \
+              'CONFIG_VERSION_CODE_FILENAMES=n'
+          } > .config
+
           make defconfig
+
+          # 防呆：确认注入没被 defconfig 剥掉，否则固件会退回 SNAPSHOT
+          grep -q '^CONFIG_VERSIONOPT=y$' .config
+          grep -q "^CONFIG_VERSION_DIST=\"PonWrt\"$" .config
+          grep -q "^CONFIG_VERSION_NUMBER=\"$BUILD_VERSION\"$" .config
+
+          echo "===== 已注入的版本配置 ====="
+          grep 'VERSION' .config | sort
 
       - name: Download sources
         run: make download -j"$(nproc)"
 
       - name: Build ${{ matrix.target }}
         run: make -j"$(nproc)"
+
+      # 编译完就核对一次产物里的版本串，避免刷完才发现还是 SNAPSHOT
+      - name: Verify embedded version
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          f="$(find bin -name 'version.buildinfo' -type f 2>/dev/null | head -1)"
+          if [ -z "$f" ]; then
+            echo "::warning::未找到 version.buildinfo，跳过产物版本校验"
+            exit 0
+          fi
+          echo "===== $f ====="
+          cat "$f"
+          grep -q "$BUILD_VERSION" "$f" || {
+            echo "::error::产物里的版本号未包含 $BUILD_VERSION"
+            exit 1
+          }
 
       - name: Pack ${{ matrix.target }}
         run: |
