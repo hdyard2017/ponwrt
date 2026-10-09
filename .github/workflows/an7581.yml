@@ -308,16 +308,24 @@ jobs:
           }
 
       # 不再打 tar 包：原来 release 只挂一个 ~330MB 的压缩包，
-      # 想刷某个型号得整包下载再解压挑文件；现在把 .itb 原样平铺送进 release
+      # 想刷某个型号得整包下载再解压挑文件；现在把 .itb 平铺送进 release
+      # 并加上版本号前缀 —— 固件文件名本身不含版本（VERSION_FILENAMES=n），
+      # 不带前缀的话各 release 里的资产会完全同名，下载后分不清是哪天编译的
       - name: Collect ${{ matrix.target }} images
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
+
+          # tag 理论上可能含 / 或空格，做成文件名前缀前先规整掉
+          PREFIX="$(printf '%s' "$BUILD_VERSION" | tr '/ ' '__')"
+          echo "文件前缀 = ${PREFIX}-"
 
           mkdir -p release
           count=0
           for f in bin/targets/airoha/${{ matrix.target }}/*.itb; do
             [ -e "$f" ] || continue
-            cp "$f" release/
+            cp "$f" "release/${PREFIX}-$(basename "$f")"
             count=$((count + 1))
           done
 
