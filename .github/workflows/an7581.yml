@@ -59,13 +59,18 @@ jobs:
             PRERELEASE="${INPUT_PRERELEASE:-true}"
           fi
 
-          # 同一天的版本已存在时，定时构建直接跳过，避免重复编译
+          # 该 tag 已存在时：
+          #   定时构建 → 跳过，避免重复编译
+          #   手动构建 → 立刻失败，否则要等 6 小时编译完才在 gh release create 报“已存在”
           SKIP="false"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::warning::Release $TAG already exists"
             if [ "$EVENT_NAME" = "schedule" ]; then
               echo "Scheduled run: $TAG already released, skipping build"
               SKIP="true"
+            else
+              echo "::error::tag '$TAG' 已存在，请换一个没用过的 tag（想用同名重发请先删掉旧 release）"
+              exit 1
             fi
           fi
 
