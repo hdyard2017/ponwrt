@@ -307,17 +307,32 @@ jobs:
             exit 1
           }
 
-      - name: Pack ${{ matrix.target }}
+      # 不再打 tar 包：原来 release 只挂一个 ~330MB 的压缩包，
+      # 想刷某个型号得整包下载再解压挑文件；现在把 .itb 原样平铺送进 release
+      - name: Collect ${{ matrix.target }} images
         run: |
-          mkdir release
-          tar --zstd -cf "release/ponwrt-${{ matrix.target }}.tar.zst" \
-            -C bin/targets/airoha "${{ matrix.target }}"
+          set -euo pipefail
+
+          mkdir -p release
+          count=0
+          for f in bin/targets/airoha/${{ matrix.target }}/*.itb; do
+            [ -e "$f" ] || continue
+            cp "$f" release/
+            count=$((count + 1))
+          done
+
+          echo "===== 收集到 ${count} 个 .itb ====="
+          ls -lh release/
+          if [ "$count" -eq 0 ]; then
+            echo "::error::bin/targets/airoha/${{ matrix.target }}/ 下没有 .itb 产物"
+            exit 1
+          fi
 
       - name: Upload ${{ matrix.target }}
         uses: actions/upload-artifact@v4
         with:
           name: ponwrt-${{ matrix.target }}
-          path: release/*.tar.zst
+          path: release/*.itb
           if-no-files-found: error
           retention-days: 7
 
@@ -330,7 +345,7 @@ jobs:
       contents: write
 
     steps:
-      - name: Download firmware archives
+      - name: Download firmware images
         uses: actions/download-artifact@v4
         with:
           pattern: ponwrt-*
@@ -339,7 +354,13 @@ jobs:
 
       - name: Create checksums
         working-directory: release
-        run: sha256sum *.tar.zst > sha256sums
+        run: |
+          set -euo pipefail
+          echo "===== 待发布的固件 ====="
+          ls -lh
+          sha256sum *.itb > sha256sums
+          echo "===== sha256sums ====="
+          cat sha256sums
 
       - name: Create GitHub release
         env:
@@ -349,9 +370,10 @@ jobs:
           # tag 指向合并后的提交（已推回 fork，一定真实存在）
           BUILD_SHA: ${{ needs.sync.outputs.sha }}
         run: |
+          set -euo pipefail
           args=(
             "$RELEASE_TAG"
-            release/*.tar.zst
+            release/*.itb
             release/sha256sums
             --repo "$GITHUB_REPOSITORY"
             --target "$BUILD_SHA"
