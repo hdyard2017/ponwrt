@@ -257,14 +257,24 @@ jobs:
           printf '%s\n' "$BUILD_VERSION" > version
 
           # 合并基础配置 + release 开关，再追加版本信息覆盖。
-          # VERSION_DIST 与 VERSION_FILENAMES 必须显式给出，否则会继承 Kconfig 默认值：
-          #   VERSION_DIST      默认 ImmortalWrt（会把发行版名改掉）
-          #   VERSION_FILENAMES 默认 y（会把版本号加进固件文件名）
+          #
+          # ⚠️ CONFIG_IMAGEOPT=y 不能少：VERSIONOPT 的定义是
+          #      menuconfig VERSIONOPT
+          #          bool "Version configuration options" if IMAGEOPT
+          #    而 IMAGEOPT 由 scripts/package-metadata.pl 现场生成、**默认 n**
+          #    ⇒ IMAGEOPT 不打开时 VERSIONOPT 不可见，CONFIG_VERSIONOPT=y 会被
+          #      defconfig 静默丢弃，固件退回 "PonWrt SNAPSHOT r0-xxxxxxx"。
+          #
+          # ⚠️ VERSION_DIST / VERSION_FILENAMES 必须显式给值，否则继承 Kconfig 默认：
+          #      VERSION_DIST      默认 ImmortalWrt（而 version.mk 的回退值是 PonWrt
+          #                        ⇒ 不写反而会把发行版名从 PonWrt 改成 ImmortalWrt）
+          #      VERSION_FILENAMES 默认 y（会被 include/image.mk 塞进固件文件名）
           {
             ./scripts/kconfig.pl + \
               "configs/${{ matrix.target }}.config" \
               configs/release.config
             printf '%s\n' \
+              'CONFIG_IMAGEOPT=y' \
               'CONFIG_VERSIONOPT=y' \
               'CONFIG_VERSION_DIST="PonWrt"' \
               "CONFIG_VERSION_NUMBER=\"$BUILD_VERSION\"" \
@@ -275,13 +285,33 @@ jobs:
 
           make defconfig
 
-          # 防呆：确认注入没被 defconfig 剥掉，否则固件会退回 SNAPSHOT
-          grep -q '^CONFIG_VERSIONOPT=y$' .config
-          grep -q "^CONFIG_VERSION_DIST=\"PonWrt\"$" .config
-          grep -q "^CONFIG_VERSION_NUMBER=\"$BUILD_VERSION\"$" .config
+          echo "===== defconfig 后 .config 中的相关项 ====="
+          grep -E 'IMAGEOPT|VERSION' .config | sort || true
+          echo
 
-          echo "===== 已注入的版本配置 ====="
-          grep 'VERSION' .config | sort
+          # 逐项确认注入生效。少任何一项都立刻失败并说清是哪一项，
+          # 不让 6 小时编译白跑（2026-10-10 就是在这里无声退出的）
+          rc=0
+          require() {
+            if grep -qE "$1" .config; then
+              echo "  ✅ $2"
+            else
+              echo "  ❌ $2 未生效"
+              rc=1
+            fi
+          }
+
+          require '^CONFIG_IMAGEOPT=y$'                         'IMAGEOPT=y'
+          require '^CONFIG_VERSIONOPT=y$'                       'VERSIONOPT=y'
+          require "^CONFIG_VERSION_DIST=\"PonWrt\"$"            'VERSION_DIST="PonWrt"'
+          require "^CONFIG_VERSION_NUMBER=\"$BUILD_VERSION\"$"  "VERSION_NUMBER=\"$BUILD_VERSION\""
+          require "^CONFIG_VERSION_CODE=\"$UPSTREAM_SHORT\"$"   "VERSION_CODE=\"$UPSTREAM_SHORT\""
+          require '^# CONFIG_VERSION_FILENAMES is not set$'     'VERSION_FILENAMES 已关闭'
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::版本注入未全部生效，固件会退回 SNAPSHOT —— 见上方 ❌ 项"
+            exit 1
+          fi
 
       - name: Download sources
         run: make download -j"$(nproc)"
